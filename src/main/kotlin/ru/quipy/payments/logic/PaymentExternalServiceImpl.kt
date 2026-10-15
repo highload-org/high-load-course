@@ -13,6 +13,7 @@ import ru.quipy.payments.api.PaymentAggregate
 import java.net.SocketTimeoutException
 import java.time.Duration
 import java.util.*
+import java.util.concurrent.atomic.AtomicInteger
 
 
 // Advice: always treat time as a Duration
@@ -36,10 +37,29 @@ class PaymentExternalSystemAdapterImpl(
     private val rateLimitPerSec = properties.rateLimitPerSec
     private val parallelRequests = properties.parallelRequests
 
-    private val client = OkHttpClient.Builder().build()
+    private val client = OkHttpClient.Builder()
+        .readTimeout(Duration.ofSeconds(30))
+        .build()
 
     private val rateLimiter = SlidingWindowRateLimiter(rateLimitPerSec.toLong(), Duration.ofSeconds(1))
     private val parallelSemaphore = OngoingWindow(parallelRequests)
+    private val pendingReservations = AtomicInteger(0)
+
+    override fun tryReserve(deadline: Long): Boolean {
+        while (true) {
+            val pending = pendingReservations.get()
+            val estimatedFinish = System.currentTimeMillis() +
+                maxOf(pending / parallelRequests, pending / rateLimitPerSec) * requestAverageProcessingTime.toMillis() +
+                requestAverageProcessingTime.toMillis()
+
+            if (estimatedFinish >= deadline) return false
+            if (pendingReservations.compareAndSet(pending, pending + 1)) return true
+        }
+    }
+
+    override fun releaseReservation() {
+        pendingReservations.decrementAndGet()
+    }
 
     override fun performPaymentAsync(paymentId: UUID, amount: Int, paymentStartedAt: Long, deadline: Long) {
         logger.warn("[$accountName] Submitting payment request for payment $paymentId")
