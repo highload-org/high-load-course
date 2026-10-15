@@ -6,11 +6,14 @@ import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.RequestBody
 import org.slf4j.LoggerFactory
+import ru.quipy.common.utils.OngoingWindow
+import ru.quipy.common.utils.SlidingWindowRateLimiter
 import ru.quipy.core.EventSourcingService
 import ru.quipy.payments.api.PaymentAggregate
 import java.net.SocketTimeoutException
 import java.time.Duration
 import java.util.*
+import java.util.concurrent.atomic.AtomicInteger
 
 
 // Advice: always treat time as a Duration
@@ -34,11 +37,32 @@ class PaymentExternalSystemAdapterImpl(
     private val rateLimitPerSec = properties.rateLimitPerSec
     private val parallelRequests = properties.parallelRequests
 
-    private val client = OkHttpClient.Builder().build()
+    private val client = OkHttpClient.Builder()
+        .readTimeout(Duration.ofSeconds(30))
+        .build()
+
+    private val rateLimiter = SlidingWindowRateLimiter(rateLimitPerSec.toLong(), Duration.ofSeconds(1))
+    private val parallelSemaphore = OngoingWindow(parallelRequests)
+    private val pendingReservations = AtomicInteger(0)
+
+    override fun tryReserve(deadline: Long): Boolean {
+        while (true) {
+            val pending = pendingReservations.get()
+            val estimatedFinish = System.currentTimeMillis() +
+                maxOf(pending / parallelRequests, pending / rateLimitPerSec) * requestAverageProcessingTime.toMillis() +
+                requestAverageProcessingTime.toMillis()
+
+            if (estimatedFinish >= deadline) return false
+            if (pendingReservations.compareAndSet(pending, pending + 1)) return true
+        }
+    }
+
+    override fun releaseReservation() {
+        pendingReservations.decrementAndGet()
+    }
 
     override fun performPaymentAsync(paymentId: UUID, amount: Int, paymentStartedAt: Long, deadline: Long) {
         logger.warn("[$accountName] Submitting payment request for payment $paymentId")
-
         val transactionId = UUID.randomUUID()
 
         // Вне зависимости от исхода оплаты важно отметить что она была отправлена.
@@ -50,6 +74,8 @@ class PaymentExternalSystemAdapterImpl(
         logger.info("[$accountName] Submit: $paymentId , txId: $transactionId")
 
         try {
+            parallelSemaphore.acquire()
+            rateLimiter.tickBlocking()
             val request = Request.Builder().run {
                 url("http://$paymentProviderHostPort/external/process?serviceName=$serviceName&token=$token&accountName=$accountName&transactionId=$transactionId&paymentId=$paymentId&amount=$amount")
                 post(emptyBody)
@@ -88,6 +114,8 @@ class PaymentExternalSystemAdapterImpl(
                     }
                 }
             }
+        } finally {
+            parallelSemaphore.release()
         }
     }
 
