@@ -50,7 +50,7 @@ class PaymentExternalSystemAdapterImpl(
             val pending = pendingReservations.get()
             val estimatedFinish = System.currentTimeMillis() +
                 maxOf(pending / parallelRequests, pending / rateLimitPerSec) * requestAverageProcessingTime.toMillis() +
-                requestAverageProcessingTime.toMillis()
+                requestAverageProcessingTime.toMillis() * 2
 
             if (estimatedFinish >= deadline) return false
             if (pendingReservations.compareAndSet(pending, pending + 1)) return true
