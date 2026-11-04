@@ -15,6 +15,7 @@ class TokenBucketRateLimiter(
     private val bucketMaxCapacity: Int,
     private val window: Long,
     private val timeUnit: TimeUnit = TimeUnit.MINUTES,
+    startBucket: Int = rate.coerceAtMost(bucketMaxCapacity),
 ): RateLimiter {
     companion object {
         private val logger: Logger = LoggerFactory.getLogger(TokenBucketRateLimiter::class.java)
@@ -22,21 +23,26 @@ class TokenBucketRateLimiter(
 
     private val rateLimiterScope = CoroutineScope(Executors.newSingleThreadExecutor().asCoroutineDispatcher())
 
-    private var bucket: AtomicInteger = AtomicInteger(0)
-    private var start = System.currentTimeMillis()
-    private var nextExpectedWakeUp = start + timeUnit.toMillis(window)
+    private var bucket: AtomicInteger = AtomicInteger(startBucket.coerceIn(0, bucketMaxCapacity))
 
     private val releaseJob = rateLimiterScope.launch {
+        val periodMillis = timeUnit.toMillis(window)
+        var nextExpectedWakeUp = System.currentTimeMillis() + periodMillis
+
         while (true) {
-            start = System.currentTimeMillis()
-            nextExpectedWakeUp = start + timeUnit.toMillis(window)
+            val sleepMillis = nextExpectedWakeUp - System.currentTimeMillis()
+            if (sleepMillis > 0) {
+                delay(sleepMillis)
+            }
+            nextExpectedWakeUp += periodMillis
 
             bucket.get().let { cur ->
                 bucket.addAndGet(if (cur + rate > bucketMaxCapacity) bucketMaxCapacity - cur else rate)
             }
-            delay(nextExpectedWakeUp - System.currentTimeMillis())
         }
     }.invokeOnCompletion { th -> if (th != null) logger.error("Rate limiter release job completed", th) }
+
+    fun availableTokens(): Int = bucket.get()
 
     override fun tick(): Boolean {
         while (true) {

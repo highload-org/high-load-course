@@ -41,16 +41,18 @@ class PaymentExternalSystemAdapterImpl(
         .readTimeout(Duration.ofSeconds(30))
         .build()
 
-    private val rateLimiter = SlidingWindowRateLimiter(rateLimitPerSec.toLong(), Duration.ofSeconds(1))
     private val parallelSemaphore = OngoingWindow(parallelRequests)
+    private val rateLimiter = SlidingWindowRateLimiter(rateLimitPerSec.toLong(), Duration.ofSeconds(1))
     private val pendingReservations = AtomicInteger(0)
 
     override fun tryReserve(deadline: Long): Boolean {
         while (true) {
             val pending = pendingReservations.get()
-            val estimatedFinish = System.currentTimeMillis() +
+            val now = System.currentTimeMillis()
+
+            val estimatedFinish = now +
                 maxOf(pending / parallelRequests, pending / rateLimitPerSec) * requestAverageProcessingTime.toMillis() +
-                requestAverageProcessingTime.toMillis() * 2
+                requestAverageProcessingTime.toMillis()
 
             if (estimatedFinish >= deadline) return false
             if (pendingReservations.compareAndSet(pending, pending + 1)) return true

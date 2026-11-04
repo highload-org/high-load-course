@@ -15,7 +15,7 @@ import java.util.concurrent.ThreadPoolExecutor
 import java.util.concurrent.TimeUnit
 
 @Service
-class OrderPayer {
+class OrderPayer(@Value("\${payment.queue-capacity:13}") queueCapacity: Int) {
 
     companion object {
         val logger: Logger = LoggerFactory.getLogger(OrderPayer::class.java)
@@ -31,11 +31,11 @@ class OrderPayer {
     private lateinit var paymentAccounts: List<PaymentExternalSystemAdapter>
 
     private val paymentExecutor = ThreadPoolExecutor(
-        200,
-        200,
+        16,
+        16,
         0L,
         TimeUnit.MILLISECONDS,
-        LinkedBlockingQueue(8_000),
+        LinkedBlockingQueue(queueCapacity),
         NamedThreadFactory("payment-submission-executor"),
         ThreadPoolExecutor.AbortPolicy()
     )
