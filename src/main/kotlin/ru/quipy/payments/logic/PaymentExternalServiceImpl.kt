@@ -73,14 +73,16 @@ class PaymentExternalSystemAdapterImpl(
 
         logger.info("[$accountName] Submit: $paymentId , txId: $transactionId")
 
+        var permitAcquired = false
         try {
-            parallelSemaphore.acquire()
-            rateLimiter.tickBlocking()
             val request = Request.Builder().run {
                 url("http://$paymentProviderHostPort/external/process?serviceName=$serviceName&token=$token&accountName=$accountName&transactionId=$transactionId&paymentId=$paymentId&amount=$amount")
                 post(emptyBody)
             }.build()
 
+            parallelSemaphore.acquire()
+            permitAcquired = true
+            rateLimiter.tickBlocking()
             client.newCall(request).execute().use { response ->
                 val body = try {
                     mapper.readValue(response.body?.string(), ExternalSysResponse::class.java)
@@ -114,8 +116,9 @@ class PaymentExternalSystemAdapterImpl(
                     }
                 }
             }
+            if (e is InterruptedException) Thread.currentThread().interrupt()
         } finally {
-            parallelSemaphore.release()
+            if (permitAcquired) parallelSemaphore.release()
         }
     }
 
