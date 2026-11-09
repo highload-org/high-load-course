@@ -7,7 +7,7 @@ import okhttp3.Request
 import okhttp3.RequestBody
 import org.slf4j.LoggerFactory
 import ru.quipy.common.utils.OngoingWindow
-import ru.quipy.common.utils.SlidingWindowRateLimiter
+import ru.quipy.common.utils.TokenBucketRateLimiter
 import ru.quipy.core.EventSourcingService
 import ru.quipy.payments.api.PaymentAggregate
 import java.net.SocketTimeoutException
@@ -41,16 +41,23 @@ class PaymentExternalSystemAdapterImpl(
         .readTimeout(Duration.ofSeconds(30))
         .build()
 
-    private val rateLimiter = SlidingWindowRateLimiter(rateLimitPerSec.toLong(), Duration.ofSeconds(1))
-    private val parallelSemaphore = OngoingWindow(parallelRequests)
+    private val rateLimiter = TokenBucketRateLimiter(
+        rate = rateLimitPerSec,
+        bucketMaxCapacity = rateLimitPerSec,
+        window = 1,
+    )
+    private val effectiveParallelRequests = minOf(parallelRequests, rateLimitPerSec)
+    private val parallelSemaphore = OngoingWindow(effectiveParallelRequests)
     private val pendingReservations = AtomicInteger(0)
+    private val maxPendingReservations = effectiveParallelRequests
 
     override fun tryReserve(deadline: Long): Boolean {
         while (true) {
             val pending = pendingReservations.get()
-            val estimatedFinish = System.currentTimeMillis() +
-                maxOf(pending / parallelRequests, pending / rateLimitPerSec) * requestAverageProcessingTime.toMillis() +
-                requestAverageProcessingTime.toMillis() * 2
+            if (pending >= maxPendingReservations) return false
+
+            val estimatedQueueWait = (pending.toLong() * 1000) / rateLimitPerSec
+            val estimatedFinish = System.currentTimeMillis() + estimatedQueueWait + requestAverageProcessingTime.toMillis()
 
             if (estimatedFinish >= deadline) return false
             if (pendingReservations.compareAndSet(pending, pending + 1)) return true
@@ -74,8 +81,10 @@ class PaymentExternalSystemAdapterImpl(
         logger.info("[$accountName] Submit: $paymentId , txId: $transactionId")
 
         try {
+            while (!rateLimiter.tick()) {
+                Thread.sleep(1)
+            }
             parallelSemaphore.acquire()
-            rateLimiter.tickBlocking()
             val request = Request.Builder().run {
                 url("http://$paymentProviderHostPort/external/process?serviceName=$serviceName&token=$token&accountName=$accountName&transactionId=$transactionId&paymentId=$paymentId&amount=$amount")
                 post(emptyBody)
