@@ -6,6 +6,7 @@ import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.RequestBody
 import org.slf4j.LoggerFactory
+import ru.quipy.common.utils.LeakingBucketRateLimiter
 import ru.quipy.common.utils.OngoingWindow
 import ru.quipy.common.utils.SlidingWindowRateLimiter
 import ru.quipy.core.EventSourcingService
@@ -27,6 +28,8 @@ class PaymentExternalSystemAdapterImpl(
     companion object {
         val logger = LoggerFactory.getLogger(PaymentExternalSystemAdapter::class.java)
 
+        private const val LEAKING_BUCKET_DEADLINE_THRESHOLD_MILLIS = 5_000L
+
         val emptyBody = RequestBody.create(null, ByteArray(0))
         val mapper = ObjectMapper().registerKotlinModule()
     }
@@ -42,6 +45,7 @@ class PaymentExternalSystemAdapterImpl(
         .build()
 
     private val rateLimiter = SlidingWindowRateLimiter(rateLimitPerSec.toLong(), Duration.ofSeconds(1))
+    private val leakingBucket = LeakingBucketRateLimiter(rateLimitPerSec.toLong(), Duration.ofSeconds(1))
     private val parallelSemaphore = OngoingWindow(parallelRequests)
     private val pendingReservations = AtomicInteger(0)
 
@@ -49,8 +53,8 @@ class PaymentExternalSystemAdapterImpl(
         while (true) {
             val pending = pendingReservations.get()
             val estimatedFinish = System.currentTimeMillis() +
-                maxOf(pending / parallelRequests, pending / rateLimitPerSec) * requestAverageProcessingTime.toMillis() +
-                requestAverageProcessingTime.toMillis() * 2
+                    maxOf(pending / parallelRequests, pending / rateLimitPerSec) * requestAverageProcessingTime.toMillis() +
+                    requestAverageProcessingTime.toMillis() * 2
 
             if (estimatedFinish >= deadline) return false
             if (pendingReservations.compareAndSet(pending, pending + 1)) return true
@@ -73,16 +77,18 @@ class PaymentExternalSystemAdapterImpl(
 
         logger.info("[$accountName] Submit: $paymentId , txId: $transactionId")
 
-        var permitAcquired = false
         try {
+            parallelSemaphore.acquire()
+            if (deadline - paymentStartedAt >= LEAKING_BUCKET_DEADLINE_THRESHOLD_MILLIS) {
+                leakingBucket.tickBlocking()
+            } else {
+                rateLimiter.tickBlocking()
+            }
             val request = Request.Builder().run {
                 url("http://$paymentProviderHostPort/external/process?serviceName=$serviceName&token=$token&accountName=$accountName&transactionId=$transactionId&paymentId=$paymentId&amount=$amount")
                 post(emptyBody)
             }.build()
 
-            parallelSemaphore.acquire()
-            permitAcquired = true
-            rateLimiter.tickBlocking()
             client.newCall(request).execute().use { response ->
                 val body = try {
                     mapper.readValue(response.body?.string(), ExternalSysResponse::class.java)
@@ -118,7 +124,7 @@ class PaymentExternalSystemAdapterImpl(
             }
             if (e is InterruptedException) Thread.currentThread().interrupt()
         } finally {
-            if (permitAcquired) parallelSemaphore.release()
+            parallelSemaphore.release()
         }
     }
 
