@@ -62,10 +62,8 @@ class APIController {
     fun payOrder(@PathVariable orderId: UUID, @RequestParam deadline: Long): ResponseEntity<Any> {
         val receivedAt = System.currentTimeMillis()
         val paymentId = UUID.randomUUID()
-        val order = orderRepository.findById(orderId)?.let {
-            orderRepository.save(it.copy(status = OrderStatus.PAYMENT_IN_PROGRESS))
-            it
-        } ?: throw IllegalArgumentException("No such order $orderId")
+        val order = orderRepository.findById(orderId)
+            ?: throw IllegalArgumentException("No such order $orderId")
         val createdAt = try {
             orderPayer.processPayment(orderId, order.price, paymentId, deadline, receivedAt)
         } catch (e: RejectedExecutionException) {
@@ -75,6 +73,7 @@ class APIController {
                 .build()
         }
 
+        orderRepository.save(order.copy(status = OrderStatus.PAYMENT_IN_PROGRESS))
         return ResponseEntity.ok(PaymentSubmissionDto(createdAt, paymentId))
     }
 

@@ -1,70 +1,74 @@
 package ru.quipy.common.utils
 
-import kotlinx.coroutines.CoroutineScope
-import kotlinx.coroutines.asCoroutineDispatcher
-import kotlinx.coroutines.delay
-import kotlinx.coroutines.launch
-import org.slf4j.Logger
-import org.slf4j.LoggerFactory
 import java.time.Duration
-import java.util.concurrent.Executors
-import java.util.concurrent.PriorityBlockingQueue
-import java.util.concurrent.atomic.AtomicLong
+import java.util.concurrent.TimeUnit
 import java.util.concurrent.locks.ReentrantLock
-import kotlin.concurrent.withLock
 
 class SlidingWindowRateLimiter(
     private val rate: Long,
-    private val window: Duration,
+    window: Duration,
 ) : RateLimiter {
-    private val rateLimiterScope = CoroutineScope(Executors.newSingleThreadExecutor().asCoroutineDispatcher())
+    private val windowNanos = window.toNanos()
+    private val permits = ArrayDeque<Long>()
+    private val lock = ReentrantLock(true)
 
-    private val sum = AtomicLong(0)
-    private val queue = PriorityBlockingQueue<Measure>(10_000)
+    @Volatile
+    private var nextPermitAt = System.nanoTime()
+
+    init {
+        require(rate > 0 && windowNanos > 0)
+    }
 
     override fun tick(): Boolean {
-        while (true) {
-            val curSum = sum.get()
-            if (curSum >= rate) return false
-            if (sum.compareAndSet(curSum, curSum + 1)) {
-                queue.add(Measure(1, System.currentTimeMillis()))
-                return true
-            }
+        if (!lock.tryLock()) return false
+        try {
+            return acquireOrGetWaitNanos() == 0L
+        } finally {
+            lock.unlock()
         }
+    }
+
+    fun estimatedWaitMillis(queuedAhead: Int): Long {
+        val waitForNextPermit = (nextPermitAt - System.nanoTime()).coerceAtLeast(0)
+        val waitForQueue = queuedAhead * windowNanos / rate
+        return TimeUnit.NANOSECONDS.toMillis(waitForNextPermit + waitForQueue)
     }
 
     fun tickBlocking() {
-        while (!tick()) {
-            Thread.sleep(10)
+        tickBlocking(Long.MAX_VALUE)
+    }
+
+    fun tickBlocking(timeoutMillis: Long): Boolean {
+        if (timeoutMillis <= 0) return false
+        val timeoutNanos = TimeUnit.MILLISECONDS.toNanos(timeoutMillis)
+        val startedAt = System.nanoTime()
+        if (!lock.tryLock(timeoutNanos, TimeUnit.NANOSECONDS)) return false
+
+        try {
+            while (true) {
+                val remaining = timeoutNanos - (System.nanoTime() - startedAt)
+                if (remaining <= 0) return false
+
+                val waitNanos = acquireOrGetWaitNanos()
+                if (waitNanos == 0L) return true
+                if (waitNanos >= remaining) return false
+
+                TimeUnit.NANOSECONDS.sleep(waitNanos)
+            }
+        } finally {
+            lock.unlock()
         }
     }
 
-    data class Measure(
-        val value: Long,
-        val timestamp: Long
-    ) : Comparable<Measure> {
-        override fun compareTo(other: Measure): Int {
-            return timestamp.compareTo(other.timestamp)
+    private fun acquireOrGetWaitNanos(): Long {
+        val now = System.nanoTime()
+        while (permits.isNotEmpty() && now - permits.first() >= windowNanos) {
+            permits.removeFirst()
         }
-    }
+        if (permits.size.toLong() >= rate) return windowNanos - (now - permits.first())
 
-    private val releaseJob = rateLimiterScope.launch {
-        while (true) {
-            val head = queue.peek()
-            val winStart = System.currentTimeMillis() - window.toMillis()
-            if (head == null) {
-                delay(1L)
-                continue
-            }
-            if (head.timestamp > winStart) {
-                delay(head.timestamp - winStart)
-                continue
-            }
-            sum.addAndGet(-1)
-            queue.take()
-        }
-    }.invokeOnCompletion { th -> if (th != null) logger.error("Rate limiter release job completed", th) }
-    companion object {
-        private val logger: Logger = LoggerFactory.getLogger(SlidingWindowRateLimiter::class.java)
+        permits.addLast(now)
+        nextPermitAt = if (permits.size.toLong() == rate) permits.first() + windowNanos else now
+        return 0
     }
 }
