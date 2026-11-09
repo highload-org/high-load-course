@@ -1,37 +1,54 @@
 package ru.quipy.common.utils
 
-import kotlinx.coroutines.CoroutineScope
-import kotlinx.coroutines.asCoroutineDispatcher
-import kotlinx.coroutines.delay
-import kotlinx.coroutines.launch
-import org.slf4j.Logger
-import org.slf4j.LoggerFactory
 import java.time.Duration
-import java.util.concurrent.Executors
-import java.util.concurrent.LinkedBlockingQueue
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.locks.ReentrantLock
 
 class LeakingBucketRateLimiter(
-    private val rate: Long,
-    private val window: Duration,
-    bucketSize: Int,
+    rate: Long,
+    window: Duration,
 ) : RateLimiter {
-    private val rateLimiterScope = CoroutineScope(Executors.newSingleThreadExecutor().asCoroutineDispatcher())
-    private val queue = LinkedBlockingQueue<Int>(bucketSize)
+    private val intervalNanos: Long
+    private val lock = ReentrantLock(true)
+    private var nextPermitAt = System.nanoTime()
 
-    override fun tick(): Boolean {
-        return queue.offer(1)
+    init {
+        require(rate > 0) { "Rate must be positive" }
+        require(!window.isZero && !window.isNegative) { "Window must be positive" }
+        intervalNanos = (window.toNanos() - 1) / rate + 1
     }
 
-    private val releaseJob = rateLimiterScope.launch {
-        while (true) {
-            delay(window.toMillis())
-            for (i in 0..rate) {
-                queue.poll()
-            }
+    override fun tick(): Boolean {
+        if (!lock.tryLock()) return false
+        try {
+            val now = System.nanoTime()
+            if (nextPermitAt - now > 0) return false
+            advanceSchedule(now)
+            return true
+        } finally {
+            lock.unlock()
         }
-    }.invokeOnCompletion { th -> if (th != null) logger.error("Rate limiter release job completed", th) }
+    }
 
-    companion object {
-        private val logger: Logger = LoggerFactory.getLogger(LeakingBucketRateLimiter::class.java)
+    @Throws(InterruptedException::class)
+    fun tickBlocking() {
+        lock.lockInterruptibly()
+        try {
+            var now = System.nanoTime()
+            while (nextPermitAt - now > 0) {
+                TimeUnit.NANOSECONDS.sleep(nextPermitAt - now)
+                now = System.nanoTime()
+            }
+
+            advanceSchedule(now)
+        } finally {
+            lock.unlock()
+        }
+    }
+
+    private fun advanceSchedule(now: Long) {
+        // Catch up small delays without accumulating permits during longer pauses.
+        val scheduledAt = if (now - nextPermitAt >= intervalNanos) now else nextPermitAt
+        nextPermitAt = scheduledAt + intervalNanos
     }
 }
