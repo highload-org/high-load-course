@@ -4,6 +4,7 @@ import com.fasterxml.jackson.databind.ObjectMapper
 import com.fasterxml.jackson.module.kotlin.registerKotlinModule
 import okhttp3.Call
 import okhttp3.Callback
+import okhttp3.Dispatcher
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.RequestBody
@@ -41,13 +42,18 @@ class PaymentExternalSystemAdapterImpl(
     private val parallelRequests = properties.parallelRequests
 
     private val queue = MiroRequestQueue(parallelRequests, rateLimitPerSec)
-    private val client = OkHttpClient.Builder().build()
+    private val client = OkHttpClient.Builder()
+        .dispatcher(Dispatcher().apply {
+            maxRequests = parallelRequests
+            maxRequestsPerHost = parallelRequests
+        })
+        .build()
 
     override suspend fun performPaymentAsync(paymentId: UUID, amount: Int, paymentStartedAt: Long, deadline: Long) {
         val queueTimeout = Duration.ofMillis(deadline)
             .minusMillis(now())
-            .plus(requestAverageProcessingTime)
-            .plusSeconds(1)
+            .minus(requestAverageProcessingTime)
+            .minusSeconds(1)
             .toKotlinDuration()
 
         val submitted = queue.submit(queueTimeout) { slot ->
