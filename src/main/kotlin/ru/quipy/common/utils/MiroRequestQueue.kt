@@ -19,8 +19,7 @@ class MiroRequestQueue(parallelRequests: Int, rateLimitPerSec: Int) {
     private val interval = ((1_000_000_000L + rateLimitPerSec - 1) / rateLimitPerSec).nanoseconds
     private var lastSubmission: TimeSource.Monotonic.ValueTimeMark? = null
 
-    /** Returns false if admission timed out. After a successful [send], its callback owns the slot. */
-    suspend fun submit(timeout: Duration, send: (AutoCloseable) -> Unit): Boolean {
+    suspend fun acquire(timeout: Duration, beforeSend: () -> Unit): AutoCloseable? {
         var locked = false
         var slot: AutoCloseable? = null
         try {
@@ -29,12 +28,12 @@ class MiroRequestQueue(parallelRequests: Int, rateLimitPerSec: Int) {
                 locked = true
                 waitForInterval()
                 acquireSlot().also { slot = it }
-            } ?: return false
+            } ?: return null
 
-            send(acquired)
+            beforeSend()
             lastSubmission = TimeSource.Monotonic.markNow()
             slot = null
-            return true
+            return acquired
         } finally {
             // A timeout can win after a resource is acquired but before the block returns.
             slot?.close()

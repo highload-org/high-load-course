@@ -2,18 +2,13 @@ package ru.quipy.payments.logic
 
 import com.fasterxml.jackson.databind.ObjectMapper
 import com.fasterxml.jackson.module.kotlin.registerKotlinModule
-import okhttp3.Call
-import okhttp3.Callback
-import okhttp3.Dispatcher
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.RequestBody
-import okhttp3.Response
 import org.slf4j.LoggerFactory
 import ru.quipy.common.utils.MiroRequestQueue
 import ru.quipy.core.EventSourcingService
 import ru.quipy.payments.api.PaymentAggregate
-import java.io.IOException
 import java.net.SocketTimeoutException
 import java.time.Duration
 import java.util.*
@@ -42,12 +37,7 @@ class PaymentExternalSystemAdapterImpl(
     private val parallelRequests = properties.parallelRequests
 
     private val queue = MiroRequestQueue(parallelRequests, rateLimitPerSec)
-    private val client = OkHttpClient.Builder()
-        .dispatcher(Dispatcher().apply {
-            maxRequests = parallelRequests
-            maxRequestsPerHost = parallelRequests
-        })
-        .build()
+    private val client = OkHttpClient.Builder().build()
 
     override suspend fun performPaymentAsync(paymentId: UUID, amount: Int, paymentStartedAt: Long, deadline: Long) {
         val queueTimeout = Duration.ofMillis(deadline)
@@ -56,16 +46,16 @@ class PaymentExternalSystemAdapterImpl(
             .minusSeconds(1)
             .toKotlinDuration()
 
-        val submitted = queue.submit(queueTimeout) { slot ->
-            submitPayment(paymentId, amount, paymentStartedAt, slot)
-        }
-        if (!submitted) throw RetryablePaymentException("Payment queue timed out")
+        val transactionId = UUID.randomUUID()
+        val slot = queue.acquire(queueTimeout) {
+            recordSubmission(paymentId, paymentStartedAt, transactionId)
+        } ?: throw RetryablePaymentException("Payment queue timed out")
+
+        slot.use { submitPayment(paymentId, amount, transactionId) }
     }
 
-    private fun submitPayment(paymentId: UUID, amount: Int, paymentStartedAt: Long, slot: AutoCloseable) {
+    private fun recordSubmission(paymentId: UUID, paymentStartedAt: Long, transactionId: UUID) {
         logger.warn("[$accountName] Submitting payment request for payment $paymentId")
-
-        val transactionId = UUID.randomUUID()
 
         // Вне зависимости от исхода оплаты важно отметить что она была отправлена.
         // Это требуется сделать ВО ВСЕХ СЛУЧАЯХ, поскольку эта информация используется сервисом тестирования.
@@ -74,73 +64,46 @@ class PaymentExternalSystemAdapterImpl(
         }
 
         logger.info("[$accountName] Submit: $paymentId , txId: $transactionId")
+    }
 
+    private fun submitPayment(paymentId: UUID, amount: Int, transactionId: UUID) {
         fun recordFailure(e: Exception) {
-            when (e) {
-                is SocketTimeoutException -> {
-                    logger.error("[$accountName] Payment timeout for txId: $transactionId, payment: $paymentId", e)
-                    paymentESService.update(paymentId) {
-                        it.logProcessing(false, now(), transactionId, reason = "Request timeout.")
-                    }
-                }
+            val reason = if (e is SocketTimeoutException) {
+                logger.error("[$accountName] Payment timeout for txId: $transactionId, payment: $paymentId", e)
+                "Request timeout."
+            } else {
+                logger.error("[$accountName] Payment failed for txId: $transactionId, payment: $paymentId", e)
+                e.message
+            }
 
-                else -> {
-                    logger.error("[$accountName] Payment failed for txId: $transactionId, payment: $paymentId", e)
-
-                    paymentESService.update(paymentId) {
-                        it.logProcessing(false, now(), transactionId, reason = e.message)
-                    }
-                }
+            paymentESService.update(paymentId) {
+                it.logProcessing(false, now(), transactionId, reason = reason)
             }
         }
 
-        try {
+        val result = try {
             val request = Request.Builder().run {
                 url("http://$paymentProviderHostPort/external/process?serviceName=$serviceName&token=$token&accountName=$accountName&transactionId=$transactionId&paymentId=$paymentId&amount=$amount")
                 post(emptyBody)
             }.build()
 
-            client.newCall(request).enqueue(object : Callback {
-                override fun onResponse(call: Call, response: Response) {
-                    try {
-                        response.use {
-                            val responseBody = response.body?.string()
-                            val body = try {
-                                mapper.readValue(responseBody, ExternalSysResponse::class.java)
-                            } catch (e: Exception) {
-                                logger.error("[$accountName] [ERROR] Payment processed for txId: $transactionId, payment: $paymentId, result code: ${response.code}, reason: $responseBody", e)
-                                ExternalSysResponse(transactionId.toString(), paymentId.toString(), false, e.message)
-                            }
-
-                            logger.warn("[$accountName] Payment processed for txId: $transactionId, payment: $paymentId, succeeded: ${body.result}, message: ${body.message}")
-
-                            // Здесь мы обновляем состояние оплаты в зависимости от результата в базе данных оплат.
-                            // Это требуется сделать ВО ВСЕХ ИСХОДАХ (успешная оплата / неуспешная / ошибочная ситуация)
-                            paymentESService.update(paymentId) {
-                                it.logProcessing(body.result, now(), transactionId, reason = body.message)
-                            }
-                        }
-                    } catch (e: Exception) {
-                        recordFailure(e)
-                    } finally {
-                        slot.close()
-                    }
+            client.newCall(request).execute().use { response ->
+                val responseBody = response.body?.string()
+                try {
+                    mapper.readValue(responseBody, ExternalSysResponse::class.java)
+                } catch (e: Exception) {
+                    logger.error("[$accountName] [ERROR] Payment processed for txId: $transactionId, payment: $paymentId, result code: ${response.code}, reason: $responseBody", e)
+                    ExternalSysResponse(transactionId.toString(), paymentId.toString(), false, e.message)
                 }
-
-                override fun onFailure(call: Call, e: IOException) {
-                    try {
-                        recordFailure(e)
-                    } finally {
-                        slot.close()
-                    }
-                }
-            })
-        } catch (e: Exception) {
-            try {
-                recordFailure(e)
-            } finally {
-                slot.close()
             }
+        } catch (e: Exception) {
+            recordFailure(e)
+            return
+        }
+
+        logger.warn("[$accountName] Payment processed for txId: $transactionId, payment: $paymentId, succeeded: ${result.result}, message: ${result.message}")
+        paymentESService.update(paymentId) {
+            it.logProcessing(result.result, now(), transactionId, reason = result.message)
         }
     }
 
