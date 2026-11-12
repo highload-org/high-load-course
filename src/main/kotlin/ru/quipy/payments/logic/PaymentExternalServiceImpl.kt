@@ -2,7 +2,6 @@ package ru.quipy.payments.logic
 
 import com.fasterxml.jackson.databind.ObjectMapper
 import com.fasterxml.jackson.module.kotlin.registerKotlinModule
-import kotlinx.coroutines.withTimeoutOrNull
 import okhttp3.Call
 import okhttp3.Callback
 import okhttp3.OkHttpClient
@@ -10,7 +9,7 @@ import okhttp3.Request
 import okhttp3.RequestBody
 import okhttp3.Response
 import org.slf4j.LoggerFactory
-import ru.quipy.common.utils.ParallelRequestQueue
+import ru.quipy.common.utils.MiroRequestQueue
 import ru.quipy.core.EventSourcingService
 import ru.quipy.payments.api.PaymentAggregate
 import java.io.IOException
@@ -41,7 +40,7 @@ class PaymentExternalSystemAdapterImpl(
     private val rateLimitPerSec = properties.rateLimitPerSec
     private val parallelRequests = properties.parallelRequests
 
-    private val queue = ParallelRequestQueue(parallelRequests)
+    private val queue = MiroRequestQueue(parallelRequests, rateLimitPerSec)
     private val client = OkHttpClient.Builder().build()
 
     override suspend fun performPaymentAsync(paymentId: UUID, amount: Int, paymentStartedAt: Long, deadline: Long) {
@@ -51,18 +50,10 @@ class PaymentExternalSystemAdapterImpl(
             .plusSeconds(1)
             .toKotlinDuration()
 
-        var acquired: AutoCloseable? = null
-        try {
-            val slot = withTimeoutOrNull(queueTimeout) {
-                // The timeout can win after acquire() returns but before this block returns its result.
-                queue.acquire().also { acquired = it }
-            } ?: throw RetryablePaymentException("Payment queue timed out")
-
+        val submitted = queue.submit(queueTimeout) { slot ->
             submitPayment(paymentId, amount, paymentStartedAt, slot)
-        } catch (e: Throwable) {
-            acquired?.close()
-            throw e
         }
+        if (!submitted) throw RetryablePaymentException("Payment queue timed out")
     }
 
     private fun submitPayment(paymentId: UUID, amount: Int, paymentStartedAt: Long, slot: AutoCloseable) {
