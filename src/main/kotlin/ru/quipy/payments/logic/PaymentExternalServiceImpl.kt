@@ -101,6 +101,10 @@ class PaymentExternalSystemAdapterImpl(
             return
         }
 
+        if (!result.result && result.message == "Temporary error") {
+            throw RetryablePaymentException("Temporary error. Try again later!")
+        }
+
         logger.warn("[$accountName] Payment processed for txId: $transactionId, payment: $paymentId, succeeded: ${result.result}, message: ${result.message}")
         paymentESService.update(paymentId) {
             it.logProcessing(result.result, now(), transactionId, reason = result.message)
