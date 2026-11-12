@@ -8,8 +8,8 @@ import org.springframework.web.bind.annotation.*
 import org.springframework.web.server.ResponseStatusException
 import ru.quipy.orders.repository.OrderRepository
 import ru.quipy.payments.logic.OrderPayer
+import ru.quipy.payments.logic.RetryablePaymentException
 import java.util.*
-import java.util.concurrent.RejectedExecutionException
 
 @RestController
 class APIController {
@@ -64,7 +64,7 @@ class APIController {
 
         val createdAt = try {
             orderPayer.processPayment(orderId, order.price, paymentId, deadline)
-        } catch (e: RejectedExecutionException) {
+        } catch (e: RetryablePaymentException) {
             throw ResponseStatusException(HttpStatus.TOO_MANY_REQUESTS, e.message, e)
         }
         orderRepository.save(order.copy(status = OrderStatus.PAYMENT_IN_PROGRESS))

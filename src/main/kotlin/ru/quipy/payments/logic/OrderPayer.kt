@@ -9,7 +9,6 @@ import org.springframework.stereotype.Service
 import ru.quipy.core.EventSourcingService
 import ru.quipy.payments.api.PaymentAggregate
 import java.util.*
-import java.util.concurrent.RejectedExecutionException
 
 @Service
 class OrderPayer {
@@ -27,7 +26,7 @@ class OrderPayer {
     suspend fun processPayment(orderId: UUID, amount: Int, paymentId: UUID, deadline: Long): Long {
         val createdAt = System.currentTimeMillis()
         if (deadline <= createdAt) {
-            throw RejectedExecutionException("Payment deadline has expired")
+            throw RetryablePaymentException("Payment deadline has expired")
         }
 
         withContext(Dispatchers.IO) {

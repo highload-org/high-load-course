@@ -2,6 +2,7 @@ package ru.quipy.payments.logic
 
 import com.fasterxml.jackson.databind.ObjectMapper
 import com.fasterxml.jackson.module.kotlin.registerKotlinModule
+import kotlinx.coroutines.withTimeoutOrNull
 import okhttp3.Call
 import okhttp3.Callback
 import okhttp3.OkHttpClient
@@ -9,12 +10,14 @@ import okhttp3.Request
 import okhttp3.RequestBody
 import okhttp3.Response
 import org.slf4j.LoggerFactory
+import ru.quipy.common.utils.ParallelRequestQueue
 import ru.quipy.core.EventSourcingService
 import ru.quipy.payments.api.PaymentAggregate
 import java.io.IOException
 import java.net.SocketTimeoutException
 import java.time.Duration
 import java.util.*
+import kotlin.time.toKotlinDuration
 
 
 // Advice: always treat time as a Duration
@@ -38,9 +41,31 @@ class PaymentExternalSystemAdapterImpl(
     private val rateLimitPerSec = properties.rateLimitPerSec
     private val parallelRequests = properties.parallelRequests
 
+    private val queue = ParallelRequestQueue(parallelRequests)
     private val client = OkHttpClient.Builder().build()
 
-    override fun performPaymentAsync(paymentId: UUID, amount: Int, paymentStartedAt: Long, deadline: Long) {
+    override suspend fun performPaymentAsync(paymentId: UUID, amount: Int, paymentStartedAt: Long, deadline: Long) {
+        val queueTimeout = Duration.ofMillis(deadline)
+            .minusMillis(now())
+            .plus(requestAverageProcessingTime)
+            .plusSeconds(1)
+            .toKotlinDuration()
+
+        var acquired: AutoCloseable? = null
+        try {
+            val slot = withTimeoutOrNull(queueTimeout) {
+                // The timeout can win after acquire() returns but before this block returns its result.
+                queue.acquire().also { acquired = it }
+            } ?: throw RetryablePaymentException("Payment queue timed out")
+
+            submitPayment(paymentId, amount, paymentStartedAt, slot)
+        } catch (e: Throwable) {
+            acquired?.close()
+            throw e
+        }
+    }
+
+    private fun submitPayment(paymentId: UUID, amount: Int, paymentStartedAt: Long, slot: AutoCloseable) {
         logger.warn("[$accountName] Submitting payment request for payment $paymentId")
 
         val transactionId = UUID.randomUUID()
@@ -100,15 +125,25 @@ class PaymentExternalSystemAdapterImpl(
                         }
                     } catch (e: Exception) {
                         recordFailure(e)
+                    } finally {
+                        slot.close()
                     }
                 }
 
                 override fun onFailure(call: Call, e: IOException) {
-                    recordFailure(e)
+                    try {
+                        recordFailure(e)
+                    } finally {
+                        slot.close()
+                    }
                 }
             })
         } catch (e: Exception) {
-            recordFailure(e)
+            try {
+                recordFailure(e)
+            } finally {
+                slot.close()
+            }
         }
     }
 
