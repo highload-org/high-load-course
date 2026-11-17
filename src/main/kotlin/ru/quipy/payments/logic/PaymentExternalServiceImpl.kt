@@ -33,6 +33,7 @@ class PaymentExternalSystemAdapterImpl(
     private val serviceName = properties.serviceName
     private val accountName = properties.accountName
     private val requestAverageProcessingTime = properties.averageProcessingTime
+    private val requestTimeout = requestAverageProcessingTime.plusMillis(800)
     private val rateLimitPerSec = properties.rateLimitPerSec
     private val parallelRequests = properties.parallelRequests
 
@@ -83,11 +84,14 @@ class PaymentExternalSystemAdapterImpl(
 
         val result = try {
             val request = Request.Builder().run {
-                url("http://$paymentProviderHostPort/external/process?serviceName=$serviceName&token=$token&accountName=$accountName&transactionId=$transactionId&paymentId=$paymentId&amount=$amount")
+                url("http://$paymentProviderHostPort/external/process?serviceName=$serviceName&token=$token&accountName=$accountName&transactionId=$transactionId&paymentId=$paymentId&amount=$amount&timeout=$requestTimeout")
                 post(emptyBody)
             }.build()
 
             client.newCall(request).execute().use { response ->
+                if (response.code == 408) {
+                    throw RetryablePaymentException("Payment provider timed out. Try again later!")
+                }
                 val responseBody = response.body?.string()
                 try {
                     mapper.readValue(responseBody, ExternalSysResponse::class.java)
@@ -96,6 +100,8 @@ class PaymentExternalSystemAdapterImpl(
                     ExternalSysResponse(transactionId.toString(), paymentId.toString(), false, e.message)
                 }
             }
+        } catch (e: RetryablePaymentException) {
+            throw e
         } catch (e: Exception) {
             recordFailure(e)
             return
